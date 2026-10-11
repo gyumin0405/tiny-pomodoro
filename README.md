@@ -55,3 +55,11 @@ native\build.bat
 | `native/pomodoro.c` | 타이머 전체 소스 |
 | `native/emoji_data.h` | 내장 이모지 데이터 (`gen_emoji.ps1`로 `emoji/*.png`에서 생성) |
 | `make_icon.ps1` | `icon/tomato-sauce.png` → `tomato-sauce.ico` 변환 |
+
+## 라이선스
+
+코드는 [MIT License](LICENSE)를 따릅니다.
+
+## Credits
+
+- 앱 아이콘: <a href="https://www.flaticon.com/free-icons/can" title="can icons">Can icons created by Magnific - Flaticon</a> ([Tomato sauce](https://www.flaticon.com/free-icon/tomato-sauce_904183), Flaticon License). 아이콘은 MIT 라이선스 대상이 아닙니다.
