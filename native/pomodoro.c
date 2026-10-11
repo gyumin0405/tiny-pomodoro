@@ -29,12 +29,15 @@ void *memcpy(void *d, const void *s, size_t n) { unsigned char *p = d; const uns
 #define T_BLINK 3
 #define T_TOP   4
 
-enum { FOCUS, BREAK };
-enum { CMD_25 = 1, CMD_50, CMD_SWITCH, CMD_RESET, CMD_HOME, CMD_EXIT };
+#define LONG_EVERY 4   // 공부 4회마다 긴 휴식 (Cirillo 원래 방식, Pomofocus 등 기본값)
+
+enum { FOCUS, BREAK, LONG_BREAK };
+enum { CMD_25 = 1, CMD_50, CMD_LONG, CMD_SWITCH, CMD_RESET, CMD_HOME, CMD_EXIT };
 
 static HWND hwnd;
 static int dpi, W, H, pad, emoSize, topY;
-static int focusMin = 25, breakMin = 5, phase = FOCUS;
+static int focusMin = 25, breakMin = 5, longMin = 15, phase = FOCUS;
+static int longOn = 1, doneCount;   // doneCount: 이번 세트에서 끝까지 마친 공부 횟수
 static int running, finished, blinkOn;
 static LONGLONG remainMs;
 static ULONGLONG endTick;
@@ -48,7 +51,8 @@ static WCHAR iniPath[MAX_PATH];
 
 static int S(int v) { return (v * dpi + 48) / 96; }
 static int Abs(int v) { return v < 0 ? -v : v; }
-static LONGLONG PhaseMs(void) { return (LONGLONG)(phase == FOCUS ? focusMin : breakMin) * 60000; }
+static int PhaseMin(void) { return phase == FOCUS ? focusMin : phase == BREAK ? breakMin : longMin; }
+static LONGLONG PhaseMs(void) { return (LONGLONG)PhaseMin() * 60000; }
 
 static WCHAR *PutInt(WCHAR *p, int v)
 {
@@ -132,11 +136,18 @@ static void Render(void)
 
     Fill(0, 0, W, H, finished && blinkOn ? BG_FLASH : BG_COLOR);
 
-    // 상단: 🔥 공부 25분
-    WCHAR buf[16], *p = PutStr(buf, phase == FOCUS ? L"공부 " : L"휴식 ");
+    // 상단: 🔥 공부 25분 2/4
+    WCHAR buf[16], *p = PutStr(buf, phase == FOCUS ? L"공부 " : phase == BREAK ? L"휴식 " : L"긴 휴식 ");
     if (finished) p = PutStr(p, L"끝!");
-    else { p = PutInt(p, phase == FOCUS ? focusMin : breakMin); *p++ = L'분'; }
-    Text(fontSmall, accent, pad + emoSize + S(2) + gp, y, buf, (int)(p - buf));
+    else { p = PutInt(p, PhaseMin()); *p++ = L'분'; }
+    int lx = pad + emoSize + S(2) + gp;
+    Text(fontSmall, accent, lx, y, buf, (int)(p - buf));
+    if (longOn && phase == FOCUS) {   // 이번 세트에서 몇 번째 공부인지
+        int lw = TextW(fontSmall, buf, (int)(p - buf));
+        WCHAR c[8], *q = PutInt(c, finished ? doneCount : doneCount + 1);
+        *q++ = L'/'; q = PutInt(q, LONG_EVERY);
+        Text(fontSmall, DIM_TEXT, lx + lw + S(4), y, c, (int)(q - c));
+    }
 
     if (finished) {
         int aw = TextW(fontSmall, L"→", 1);
@@ -173,6 +184,7 @@ static void SaveSettings(void)
     RECT r; GetWindowRect(hwnd, &r);
     char buf[64]; WCHAR w[64], *p = w;
     p = PutStr(p, L"mode="); p = PutInt(p, focusMin);
+    p = PutStr(p, L"\r\nlong="); p = PutInt(p, longOn);
     p = PutStr(p, L"\r\nx="); p = PutInt(p, r.left);
     p = PutStr(p, L"\r\ny="); p = PutInt(p, r.top);
     p = PutStr(p, L"\r\n");
@@ -200,7 +212,8 @@ static int LoadSettings(POINT *pt)
             s++; int neg = *s == '-', v = 0, ok = 0; if (neg) s++;
             while (*s >= '0' && *s <= '9') { v = v * 10 + *s++ - '0'; ok = 1; }
             if (neg) v = -v;
-            if (ok && key == 'm' && v == 50) { focusMin = 50; breakMin = 10; }
+            if (ok && key == 'm' && v == 50) { focusMin = 50; breakMin = 10; longMin = 30; }
+            if (ok && key == 'l') longOn = v != 0;
             if (ok && key == 'x') { pt->x = v; hasX = 1; }
             if (ok && key == 'y') { pt->y = v; hasY = 1; }
         }
@@ -270,15 +283,26 @@ static void Pause(void)
 
 static void SwitchPhase(int autoStart)
 {
-    phase = phase == FOCUS ? BREAK : FOCUS;
+    if (phase == FOCUS) phase = longOn && doneCount >= LONG_EVERY ? LONG_BREAK : BREAK;
+    else {
+        if (phase == LONG_BREAK) doneCount = 0;   // 긴 휴식이 지나면 새 세트
+        phase = FOCUS;
+    }
     ResetPhase();
     if (autoStart) Start();
 }
 
-static void SetMode(int f, int b)
+static void SetMode(int f, int b, int l)
 {
-    focusMin = f; breakMin = b;
+    focusMin = f; breakMin = b; longMin = l;
     ResetPhase(); SaveSettings();
+}
+
+static void ToggleLong(void)
+{
+    longOn = !longOn; doneCount = 0;
+    if (!longOn && phase == LONG_BREAK) { phase = BREAK; ResetPhase(); }
+    Redraw(); SaveSettings();
 }
 
 static void OnTick(void)
@@ -286,6 +310,7 @@ static void OnTick(void)
     LONGLONG r = (LONGLONG)(endTick - GetTickCount64());
     if (r <= 0) {
         remainMs = 0; running = 0; finished = 1; blinkOn = 1;
+        if (longOn && phase == FOCUS && doneCount < LONG_EVERY) doneCount++;
         KillTimer(hwnd, T_TICK);
         SetTimer(hwnd, T_BLINK, 600, NULL);
         MessageBeep(MB_ICONEXCLAMATION);
@@ -321,6 +346,9 @@ static void ShowMenu(void)
     AppendMenuW(m, MF_STRING | (focusMin == 25 ? MF_CHECKED : 0), CMD_25, L"25분 공부 / 5분 휴식");
     AppendMenuW(m, MF_STRING | (focusMin == 50 ? MF_CHECKED : 0), CMD_50, L"50분 공부 / 10분 휴식");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | (longOn ? MF_CHECKED : 0), CMD_LONG,
+                longMin == 30 ? L"4회마다 긴 휴식 (30분)" : L"4회마다 긴 휴식 (15분)");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, CMD_SWITCH, L"공부 ↔ 휴식 전환");
     AppendMenuW(m, MF_STRING, CMD_RESET, L"리셋");
     AppendMenuW(m, MF_STRING, CMD_HOME, L"위치 초기화 (왼쪽 아래)");
@@ -336,8 +364,9 @@ static void ShowMenu(void)
     menuOpen = 0;
 
     switch (cmd) {
-    case CMD_25: SetMode(25, 5); break;
-    case CMD_50: SetMode(50, 10); break;
+    case CMD_25: SetMode(25, 5, 15); break;
+    case CMD_50: SetMode(50, 10, 30); break;
+    case CMD_LONG: ToggleLong(); break;
     case CMD_SWITCH: SwitchPhase(0); break;
     case CMD_RESET: ResetPhase(); break;
     case CMD_HOME: { POINT d = DefaultLocation(); SetWindowPos(hwnd, NULL, d.x, d.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE); SaveSettings(); } break;
