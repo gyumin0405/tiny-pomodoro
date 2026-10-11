@@ -4,6 +4,18 @@
 
 순수 Win32 C로 작성했고 C 런타임 없이 빌드합니다. 실행 중에도 **메모리 약 0.4MB, CPU는 거의 0**입니다.
 
+<p align="center"><img src="docs/focus.png" width="290" alt="공부 중인 타이머: 🔥 공부 25분, 18:42"></p>
+
+## 화면
+
+| 시작 전 | 공부 중 | 일시정지 |
+|:-:|:-:|:-:|
+| <img src="docs/idle.png" width="220" alt="시작 전 25:00"> | <img src="docs/focus.png" width="220" alt="공부 중 18:42"> | <img src="docs/paused.png" width="220" alt="일시정지 12:07"> |
+| **공부 끝 (클릭하면 휴식)** | **휴식 중** | **휴식 끝 (클릭하면 공부)** |
+| <img src="docs/focus_done.png" width="220" alt="공부 끝, 다음은 휴식"> | <img src="docs/break.png" width="220" alt="휴식 중 03:15"> | <img src="docs/break_done.png" width="220" alt="휴식 끝, 다음은 공부"> |
+
+평소엔 75% 투명하게 떠 있다가 마우스를 올리면 위처럼 또렷해집니다. 시간이 끝나면 알림음과 함께 깜빡입니다.
+
 ## 기능
 
 - 화면 왼쪽 아래에 작게 표시, 항상 위
