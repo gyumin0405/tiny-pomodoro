@@ -7,7 +7,7 @@ gcc -Os -s -std=c11 -ffreestanding -fno-builtin -fno-tree-loop-distribute-patter
   -fno-asynchronous-unwind-tables -fno-ident -fno-stack-check -mno-stack-arg-probe ^
   -ffunction-sections -fdata-sections -nostdlib -nostartfiles -e start ^
   -Wl,--subsystem,windows -Wl,--gc-sections -Wl,--build-id=none ^
-  pomodoro.c pomodoro_res.o -lkernel32 -luser32 -lgdi32 -ldwmapi ^
+  pomodoro.c pomodoro_res.o -lkernel32 -luser32 -lgdi32 -ldwmapi -lshell32 -ladvapi32 ^
   -o ..\PomodoroNative.exe || (pause & exit /b 1)
 del pomodoro_res.o
 echo Build OK: %~dp0..\PomodoroNative.exe
