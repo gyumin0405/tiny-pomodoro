@@ -6,6 +6,8 @@
 // - 이모지는 exe에 내장한 48px 이미지를 시작할 때 한 번만 축소해 둠
 // 오른쪽 클릭 → 화면 전환으로 "인터넷 차단" 화면: 지금부터 N시간 동안 크롬/엣지의 웹페이지를
 // 브라우저 정책으로 막음. 해제는 SYSTEM 예약 작업이 하므로 앱을 꺼도, 재부팅해도 제때 풀림
+// 오른쪽 클릭 → 조작 패널: 위엔 최근 13주 공부 기록 잔디(25분 = 1회), 아래엔 모드/전환/리셋 등 버튼.
+// 패널은 열 때만 만들고 닫으면 없애서 평소 메모리는 그대로
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #include <windows.h>
@@ -26,6 +28,8 @@ void *memcpy(void *d, const void *s, size_t n) { unsigned char *p = d; const uns
 #define DIM_TEXT    RGBX(150, 150, 155)
 #define BAR_BG      RGBX(55, 55, 60)
 #define BLOCK_COLOR RGBX(98, 150, 235)
+#define BTN_BG      RGBX(44, 44, 48)
+#define CELL_EMPTY  RGBX(46, 46, 51)
 
 #define IDLE_ALPHA 64   // 25% 불투명 = 75% 투명
 #define T_TICK  1
@@ -34,14 +38,19 @@ void *memcpy(void *d, const void *s, size_t n) { unsigned char *p = d; const uns
 #define T_TOP   4
 #define T_BLOCK 5   // 차단 남은 시간
 #define T_PROC  6   // 관리자 권한 PowerShell이 끝났는지 확인 (적용 중에만)
+#define T_TRIM  7   // 패널을 닫고 잠시 뒤 메모리 돌려주기 (한 번만)
 
 #define LONG_EVERY 4   // 공부 4회마다 긴 휴식 (Cirillo 원래 방식, Pomofocus 등 기본값)
 
 #define BLOCK_STEP 30          // 차단 시간 조절 단위 (분)
 #define BLOCK_MAX  (12 * 60)   // 최대 차단 시간 (분)
 
+#define HIST_DAYS  100   // 공부 기록 보관 일수 (잔디는 13주 = 최대 91일)
+#define HEAT_WEEKS 13
+#define SESSION_MIN 25   // 잔디의 1회 = 25분 (50분 공부는 2회)
+
 enum { FOCUS, BREAK, LONG_BREAK };
-enum { CMD_25 = 1, CMD_50, CMD_LONG, CMD_SWITCH, CMD_RESET, CMD_HOME, CMD_EXIT, CMD_VIEW, CMD_UNBLOCK };
+enum { CMD_25 = 1, CMD_50, CMD_LONG, CMD_SWITCH, CMD_RESET, CMD_EXIT, CMD_VIEW, CMD_UNBLOCK };
 enum { VIEW_TIMER, VIEW_BLOCK };
 enum { Z_NONE, Z_MINUS, Z_PLUS, Z_START };   // 차단 화면에서 마우스가 가리키는 곳
 
@@ -52,10 +61,11 @@ static int longOn = 1, doneCount;   // doneCount: 이번 세트에서 끝까지 
 static int running, finished, blinkOn;
 static LONGLONG remainMs;
 static ULONGLONG endTick;
-static int alpha = IDLE_ALPHA, hover, menuOpen, mouseDown, dragging;
+static int alpha = IDLE_ALPHA, hover, mouseDown, dragging;
 static POINT downPos, downLoc;
-static HFONT fontSmall, fontTime, fontMid;
+static HFONT fontSmall, fontTime, fontMid, fontTiny;
 static int ascSmall, ascTime, ascMid;   // 글꼴별 기준선 위치 (큰 숫자 옆에 작은 글씨를 나란히 쓸 때)
+static int hSmall, hTiny;               // 글꼴 높이 (버튼 안 세로 가운데 맞춤)
 static HDC memDC;
 static DWORD *pix;
 static DWORD emoji[4][EMOJI_SRC * EMOJI_SRC];   // 0=불, 1=커피, 2=일시정지, 3=금지 (화면 크기로 축소된 것)
@@ -65,6 +75,16 @@ static int blockMins = 120;
 static LONGLONG blockStart, blockEnd;   // 차단 시작/끝 (1601년부터 초, 벽시계 기준이라 재시작해도 유지)
 static HANDLE applyProc;                // 실행 중인 관리자 권한 PowerShell
 static int applyBlock;                  // 1=차단 적용 중, 0=해제 적용 중
+static WCHAR histPath[MAX_PATH];        // 공부 기록 파일
+static int histToday;                   // 오늘 (1601-01-01부터 일수, 현지 날짜)
+static int histMins[HIST_DAYS];         // [i] = i일 전에 끝까지 마친 공부 시간(분)
+static HWND panel;                      // 조작 패널 (열려 있을 때만)
+static HDC panelDC;
+static HBITMAP panelBmp;
+static int PW, PH, panelHot = -1, panelCell = -1;   // 패널 크기, 마우스가 가리키는 버튼 / 잔디 칸(며칠 전)
+static int panelActive;                 // 패널이 한 번이라도 활성화됐는지
+static struct { RECT r; int cmd; } btn[12];
+static int nBtn;
 
 static int S(int v) { return (v * dpi + 48) / 96; }
 static int Abs(int v) { return v < 0 ? -v : v; }
@@ -83,6 +103,23 @@ static WCHAR *PutInt(WCHAR *p, LONGLONG v)
 static WCHAR *PutStr(WCHAR *p, const WCHAR *s) { while (*s) *p++ = *s++; return p; }
 // PowerShell 작은따옴표 문자열 안에 넣을 때 (' 는 '' 로)
 static WCHAR *PutQuoted(WCHAR *p, const WCHAR *s) { for (; *s; s++) { if (*s == L'\'') *p++ = L'\''; *p++ = *s; } return p; }
+
+// 분 → "1시간 15분", "2시간", "45분", "0분"
+static WCHAR *PutDur(WCHAR *p, int mins)
+{
+    if (mins >= 60) { p = PutInt(p, mins / 60); p = PutStr(p, L"시간"); if (mins % 60) *p++ = L' '; }
+    if (mins % 60 || !mins) { p = PutInt(p, mins % 60); *p++ = L'분'; }
+    return p;
+}
+
+// a와 b를 t% 만큼 섞은 색
+static COLORREF Mix(COLORREF a, COLORREF b, int t)
+{
+    int r = ((int)(a & 255) * (100 - t) + (int)(b & 255) * t) / 100;
+    int g = ((int)(a >> 8 & 255) * (100 - t) + (int)(b >> 8 & 255) * t) / 100;
+    int bl = ((int)(a >> 16 & 255) * (100 - t) + (int)(b >> 16 & 255) * t) / 100;
+    return RGBX(r, g, bl);
+}
 
 // ---------- 이모지: 48px 원본을 박스 필터로 n px로 축소 ----------
 
@@ -282,10 +319,53 @@ static void Render(void)
 
 // ---------- 설정 저장 ----------
 
+// ASCII만 쓰는 작은 설정/기록 파일
+static void WriteSmallFile(const WCHAR *path, const WCHAR *w, int n)
+{
+    char buf[2048];
+    if (n > (int)sizeof buf) return;
+    for (int i = 0; i < n; i++) buf[i] = (char)w[i];
+    WCHAR dir[MAX_PATH]; int len = lstrlenW(path);
+    lstrcpyW(dir, path); while (len && dir[len] != L'\\') len--; dir[len] = 0;
+    CreateDirectoryW(dir, NULL);
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wr; WriteFile(f, buf, (DWORD)n, &wr, NULL); CloseHandle(f);
+}
+
+static int ReadSmallFile(const WCHAR *path, char *buf, DWORD size)
+{
+    DWORD rd = 0;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    ReadFile(f, buf, size - 1, &rd, NULL); CloseHandle(f);
+    buf[rd] = 0;
+    return 1;
+}
+
+// "키=숫자" 한 줄을 읽음 (키는 첫 글자로 구분). 파일 끝이면 0, 숫자가 없는 줄이면 *key = 0
+static int NextKV(char **ps, char *key, LONGLONG *v)
+{
+    char *s = *ps;
+    if (!*s) return 0;
+    *key = *s; while (*s && *s != '=' && *s != '\n') s++;
+    int ok = 0; *v = 0;
+    if (*s == '=') {
+        s++; int neg = *s == '-'; if (neg) s++;
+        while (*s >= '0' && *s <= '9') { *v = *v * 10 + *s++ - '0'; ok = 1; }
+        if (neg) *v = -*v;
+    }
+    if (!ok) *key = 0;
+    while (*s && *s != '\n') s++;
+    if (*s) s++;
+    *ps = s;
+    return 1;
+}
+
 static void SaveSettings(void)
 {
     RECT r; GetWindowRect(hwnd, &r);
-    char buf[192]; WCHAR w[192], *p = w;
+    WCHAR w[192], *p = w;
     p = PutStr(p, L"mode="); p = PutInt(p, focusMin);
     p = PutStr(p, L"\r\nlong="); p = PutInt(p, longOn);
     p = PutStr(p, L"\r\nview="); p = PutInt(p, view);
@@ -295,44 +375,95 @@ static void SaveSettings(void)
     p = PutStr(p, L"\r\nx="); p = PutInt(p, r.left);
     p = PutStr(p, L"\r\ny="); p = PutInt(p, r.top);
     p = PutStr(p, L"\r\n");
-    int n = (int)(p - w);
-    for (int i = 0; i < n; i++) buf[i] = (char)w[i];
-    WCHAR dir[MAX_PATH]; int len = lstrlenW(iniPath);
-    lstrcpyW(dir, iniPath); while (len && dir[len] != L'\\') len--; dir[len] = 0;
-    CreateDirectoryW(dir, NULL);
-    HANDLE f = CreateFileW(iniPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE) return;
-    DWORD wr; WriteFile(f, buf, (DWORD)n, &wr, NULL); CloseHandle(f);
+    WriteSmallFile(iniPath, w, (int)(p - w));
 }
 
 static int LoadSettings(POINT *pt)
 {
-    char buf[256]; DWORD rd = 0;
-    HANDLE f = CreateFileW(iniPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) return 0;
-    ReadFile(f, buf, sizeof buf - 1, &rd, NULL); CloseHandle(f);
-    buf[rd] = 0;
+    char buf[256], *s = buf, key; LONGLONG v;
+    if (!ReadSmallFile(iniPath, buf, sizeof buf)) return 0;
     int hasX = 0, hasY = 0;
-    for (char *s = buf; *s; ) {
-        char key = *s; while (*s && *s != '=' && *s != '\n') s++;
-        if (*s == '=') {
-            s++; int neg = *s == '-', ok = 0; LONGLONG v = 0; if (neg) s++;
-            while (*s >= '0' && *s <= '9') { v = v * 10 + *s++ - '0'; ok = 1; }
-            if (neg) v = -v;
-            if (ok && key == 'm' && v == 50) { focusMin = 50; breakMin = 10; longMin = 30; }
-            if (ok && key == 'l') longOn = v != 0;
-            if (ok && key == 'v') view = v == VIEW_BLOCK ? VIEW_BLOCK : VIEW_TIMER;
-            if (ok && key == 'h' && v >= 1 && v <= BLOCK_MAX / 60) blockMins = (int)v * 60;   // 예전 설정 (시간 단위)
-            if (ok && key == 'd' && v >= BLOCK_STEP && v <= BLOCK_MAX && v % BLOCK_STEP == 0) blockMins = (int)v;
-            if (ok && key == 's') blockStart = v;
-            if (ok && key == 'b') blockEnd = v;
-            if (ok && key == 'x') { pt->x = (int)v; hasX = 1; }
-            if (ok && key == 'y') { pt->y = (int)v; hasY = 1; }
-        }
-        while (*s && *s != '\n') s++;
-        if (*s) s++;
+    while (NextKV(&s, &key, &v)) {
+        if (key == 'm' && v == 50) { focusMin = 50; breakMin = 10; longMin = 30; }
+        if (key == 'l') longOn = v != 0;
+        if (key == 'v') view = v == VIEW_BLOCK ? VIEW_BLOCK : VIEW_TIMER;
+        if (key == 'h' && v >= 1 && v <= BLOCK_MAX / 60) blockMins = (int)v * 60;   // 예전 설정 (시간 단위)
+        if (key == 'd' && v >= BLOCK_STEP && v <= BLOCK_MAX && v % BLOCK_STEP == 0) blockMins = (int)v;
+        if (key == 's') blockStart = v;
+        if (key == 'b') blockEnd = v;
+        if (key == 'x') { pt->x = (int)v; hasX = 1; }
+        if (key == 'y') { pt->y = (int)v; hasY = 1; }
     }
     return hasX && hasY;
+}
+
+// ---------- 공부 기록 ----------
+// 파일엔 공부한 날만 "YYYYMMDD=분" 한 줄씩. 최근 HIST_DAYS일만 보관
+
+static int DayOf(int y, int m, int d)
+{
+    SYSTEMTIME st = { (WORD)y, (WORD)m, 0, (WORD)d };
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&st, &ft)) return 0;
+    return (int)(((ULONGLONG)ft.dwHighDateTime << 32 | ft.dwLowDateTime) / 864000000000ULL);
+}
+
+static void DayDate(int day, SYSTEMTIME *st)
+{
+    ULONGLONG t = (ULONGLONG)day * 864000000000ULL;
+    FILETIME ft = { (DWORD)t, (DWORD)(t >> 32) };
+    FileTimeToSystemTime(&ft, st);
+}
+
+static int LocalDay(void)
+{
+    SYSTEMTIME st; GetLocalTime(&st);
+    return DayOf(st.wYear, st.wMonth, st.wDay);
+}
+
+// 날짜가 바뀌었으면 하루씩 밀기 (자정을 넘겨 켜 둔 경우도). 시계를 되돌린 경우는 그대로
+static void RollHistory(void)
+{
+    int k = LocalDay() - histToday;
+    if (k <= 0) return;
+    for (int i = HIST_DAYS - 1; i >= 0; i--) histMins[i] = i >= k ? histMins[i - k] : 0;
+    histToday += k;
+}
+
+static void LoadHistory(void)
+{
+    char buf[2048], *s = buf;
+    histToday = LocalDay();
+    if (!ReadSmallFile(histPath, buf, sizeof buf)) return;
+    while (*s) {
+        int ymd = 0, m = 0;
+        while (*s >= '0' && *s <= '9' && ymd < 100000000) ymd = ymd * 10 + *s++ - '0';
+        if (*s == '=') { s++; while (*s >= '0' && *s <= '9' && m < 100000) m = m * 10 + *s++ - '0'; }
+        while (*s && *s != '\n') s++;
+        if (*s) s++;
+        int d = DayOf(ymd / 10000, ymd / 100 % 100, ymd % 100), i = histToday - d;
+        if (d && i >= 0 && i < HIST_DAYS) histMins[i] = m;
+    }
+}
+
+static void SaveHistory(void)
+{
+    WCHAR w[HIST_DAYS * 16], *p = w;
+    for (int i = HIST_DAYS - 1; i >= 0; i--) {
+        if (!histMins[i]) continue;
+        SYSTEMTIME st; DayDate(histToday - i, &st);
+        p = PutInt(p, st.wYear * 10000 + st.wMonth * 100 + st.wDay); *p++ = L'=';
+        p = PutInt(p, histMins[i]); p = PutStr(p, L"\r\n");
+    }
+    WriteSmallFile(histPath, w, (int)(p - w));
+}
+
+static void AddStudy(int mins)
+{
+    RollHistory();
+    histMins[0] += mins;
+    SaveHistory();
+    if (panel) InvalidateRect(panel, NULL, FALSE);
 }
 
 static POINT DefaultLocation(void)
@@ -349,7 +480,7 @@ static void SetView(int v);
 
 static void UpdateFade(void)
 {
-    int target = (hover || finished || menuOpen || dragging) ? 255 : IDLE_ALPHA;
+    int target = (hover || finished || panel || dragging) ? 255 : IDLE_ALPHA;
     if (target != alpha) SetTimer(hwnd, T_FADE, 30, NULL);
 }
 
@@ -362,7 +493,7 @@ static void BringToTop(void)
 // 활성 창이 바뀔 때만 호출됨 (폴링 없음). 상대 앱이 늦게 z-order를 바꾸는 경우를 위해 잠시 뒤 한 번 더
 static void CALLBACK OnForeground(HWINEVENTHOOK hk, DWORD ev, HWND w, LONG obj, LONG child, DWORD tid, DWORD t)
 {
-    if (w == hwnd || menuOpen) return;
+    if (w == hwnd) return;
     BringToTop();
     SetTimer(hwnd, T_TOP, 300, NULL);
 }
@@ -424,6 +555,7 @@ static void OnTick(void)
     if (r <= 0) {
         remainMs = 0; running = 0; finished = 1; blinkOn = 1;
         if (longOn && phase == FOCUS && doneCount < LONG_EVERY) doneCount++;
+        if (phase == FOCUS) AddStudy(focusMin);
         KillTimer(hwnd, T_TICK);
         SetTimer(hwnd, T_BLINK, 600, NULL);
         MessageBeep(MB_ICONEXCLAMATION);
@@ -437,7 +569,7 @@ static void OnTick(void)
 
 static void OnFade(void)
 {
-    int target = (hover || finished || menuOpen || dragging) ? 255 : IDLE_ALPHA;
+    int target = (hover || finished || panel || dragging) ? 255 : IDLE_ALPHA;
     int d = (target - alpha) / 4;
     if (!d) d = target > alpha ? 1 : -1;
     alpha += d;
@@ -558,8 +690,7 @@ static void OnBlockTick(void)
 static void StartBlock(void)
 {
     WCHAR msg[200], *m = PutStr(msg, L"지금부터 ");
-    if (blockMins >= 60) { m = PutInt(m, blockMins / 60); m = PutStr(m, L"시간"); if (blockMins % 60) *m++ = L' '; }
-    if (blockMins % 60) { m = PutInt(m, blockMins % 60); *m++ = L'분'; }
+    m = PutDur(m, blockMins);
     m = PutStr(m, L" 동안 크롬·엣지에서 웹페이지를 막습니다.\n"
                   L"열려 있는 탭은 그대로 두고, 내 PC의 파일(PDF 등)은 계속 열 수 있습니다.\n"
                   L"다른 앱의 인터넷은 영향 없습니다.\n\n"
@@ -693,54 +824,234 @@ static void BlockClick(int x, int y)
     else if (z == Z_START) StartBlock();
 }
 
-static void ShowMenu(void)
+// ---------- 조작 패널 ----------
+// 오른쪽 클릭으로 여닫는 작은 창. 위: 공부 기록 잔디, 아래: 버튼들. 바깥을 클릭하거나 Esc로 닫힘.
+// 그리기 함수(Fill/Text)는 memDC에 그리므로 패널을 그리는 동안만 memDC를 패널 버퍼로 바꿔 끼움
+
+#define HEAT_X    S(32)   // 잔디 왼쪽 위
+#define HEAT_Y    S(48)
+#define HEAT_CELL S(12)
+#define HEAT_STEP S(15)   // 칸 + 간격
+
+static void RoundFill(int x, int y, int w, int h, int r, COLORREF c)
 {
-    HMENU m = CreatePopupMenu();
-    if (view == VIEW_BLOCK) {
-        AppendMenuW(m, MF_STRING, CMD_VIEW, L"화면 전환 (포모도로)");
-        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(m, MF_STRING | (applyProc ? MF_GRAYED : 0), CMD_UNBLOCK, L"지금 차단 해제");
-        AppendMenuW(m, MF_STRING, CMD_HOME, L"위치 초기화 (왼쪽 아래)");
-        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(m, MF_STRING, CMD_EXIT, L"종료");
+    SelectObject(memDC, GetStockObject(NULL_PEN)); SelectObject(memDC, GetStockObject(DC_BRUSH));
+    SetDCBrushColor(memDC, c);
+    RoundRect(memDC, x, y, x + w + 1, y + h + 1, r, r);   // 펜이 없으면 오른쪽/아래가 1px 덜 칠해짐
+}
+
+// 잔디 칸(열 = 주, 행 = 일~토) → 며칠 전인지. 마지막 열이 이번 주라서 오늘 이후 칸은 음수
+static int CellAgo(int col, int row)
+{
+    int wday = (histToday + 1) % 7;   // 1601-01-01은 월요일, 0 = 일요일
+    return (HEAT_WEEKS - 1 - col) * 7 + wday - row;
+}
+
+static COLORREF HeatColor(int mins)
+{
+    int n = mins / SESSION_MIN;
+    return !n ? CELL_EMPTY : Mix(CELL_EMPTY, FOCUS_COLOR, n <= 4 ? 30 : n <= 8 ? 52 : n <= 12 ? 76 : 100);
+}
+
+// 버튼을 그리고 클릭할 수 있게 등록. cmd가 0이면 누를 수 없는 버튼. toggle이면 왼쪽 정렬 + 오른쪽에 스위치
+static void Button(int x, int y, int w, int h, int cmd, const WCHAR *label, int on, int toggle)
+{
+    int hot = cmd && nBtn == panelHot;
+    if (cmd) { RECT r = { x, y, x + w, y + h }; btn[nBtn].r = r; btn[nBtn].cmd = cmd; nBtn++; }
+    COLORREF bg = on && !toggle ? Mix(BTN_BG, FOCUS_COLOR, 45) : BTN_BG;
+    RoundFill(x, y, w, h, S(6), hot ? Mix(bg, TEXT_COLOR, 10) : bg);
+    int n = lstrlenW(label), tw = TextW(fontSmall, label, n), ty = y + (h - hSmall) / 2;
+    Text(fontSmall, cmd ? TEXT_COLOR : DIM_TEXT, toggle ? x + S(10) : x + (w - tw) / 2, ty, label, n);
+    if (toggle) {
+        int sw = S(24), sh = S(14), sx = x + w - S(10) - sw, sy = y + (h - sh) / 2, k = sh - S(4);
+        RoundFill(sx, sy, sw, sh, sh, on ? FOCUS_COLOR : BAR_BG);
+        RoundFill(on ? sx + sw - S(2) - k : sx + S(2), sy + S(2), k, k, k, TEXT_COLOR);
+    }
+}
+
+static void RenderPanel(void)
+{
+    int p = S(12), right = PW - p;
+    RollHistory();
+    Fill(0, 0, PW, PH, BG_COLOR);
+    nBtn = 0;
+
+    // 상단: 오늘 3회 · 1시간 15분  ……  3개월 71회
+    int total = 0;
+    for (int c = 0; c < HEAT_WEEKS; c++)
+        for (int r = 0; r < 7; r++) { int a = CellAgo(c, r); if (a >= 0) total += histMins[a] / SESSION_MIN; }
+    WCHAR b[48], *q = PutStr(b, L"오늘 ");
+    int lw = TextW(fontSmall, b, 3);
+    Text(fontSmall, DIM_TEXT, p, S(10), b, 3);
+    q = PutInt(b, histMins[0] / SESSION_MIN); q = PutStr(q, L"회 · "); q = PutDur(q, histMins[0]);
+    Text(fontSmall, histMins[0] ? TEXT_COLOR : DIM_TEXT, p + lw, S(10), b, (int)(q - b));
+    q = PutStr(b, L"3개월 "); q = PutInt(q, total); *q++ = L'회';
+    int tw = TextW(fontSmall, b, (int)(q - b));
+    Text(fontSmall, DIM_TEXT, right - tw, S(10), b, (int)(q - b));
+
+    // 잔디: 위에 달 이름, 왼쪽에 월/수/금
+    int prevMonth = 0;
+    for (int c = 0; c < HEAT_WEEKS; c++) {
+        SYSTEMTIME st; DayDate(histToday - CellAgo(c, 0), &st);
+        if (st.wMonth != prevMonth) {
+            // 첫 열은 다음 달 이름과 겹치지 않을 때만
+            SYSTEMTIME s2; DayDate(histToday - CellAgo(2, 0), &s2);
+            if (c || s2.wMonth == st.wMonth) {
+                WCHAR mb[4], *mq = PutInt(mb, st.wMonth); *mq++ = L'월';
+                Text(fontTiny, DIM_TEXT, HEAT_X + c * HEAT_STEP, S(32), mb, (int)(mq - mb));
+            }
+            prevMonth = st.wMonth;
+        }
+    }
+    for (int r = 1; r < 7; r += 2)
+        Text(fontTiny, DIM_TEXT, p, HEAT_Y + r * HEAT_STEP + (HEAT_CELL - hTiny) / 2, &L"일월화수목금토"[r], 1);
+    for (int c = 0; c < HEAT_WEEKS; c++)
+        for (int r = 0; r < 7; r++) {
+            int a = CellAgo(c, r), x = HEAT_X + c * HEAT_STEP, y = HEAT_Y + r * HEAT_STEP;
+            if (a < 0) continue;
+            if (a == panelCell) RoundFill(x - S(1), y - S(1), HEAT_CELL + S(2), HEAT_CELL + S(2), S(4), TEXT_COLOR);
+            RoundFill(x, y, HEAT_CELL, HEAT_CELL, S(3), HeatColor(histMins[a]));
+        }
+
+    // 잔디 아래: 가리킨 날의 기록, 아니면 범례
+    int iy = HEAT_Y + 7 * HEAT_STEP + S(6);
+    if (panelCell >= 0) {
+        SYSTEMTIME st; DayDate(histToday - panelCell, &st);
+        int m = histMins[panelCell];
+        q = PutInt(b, st.wMonth); q = PutStr(q, L"월 "); q = PutInt(q, st.wDay); q = PutStr(q, L"일 (");
+        *q++ = L"일월화수목금토"[st.wDayOfWeek]; q = PutStr(q, L") · ");
+        if (m) { q = PutInt(q, m / SESSION_MIN); q = PutStr(q, L"회 · "); q = PutDur(q, m); }
+        else q = PutStr(q, L"기록 없음");
+        Text(fontSmall, TEXT_COLOR, p, iy, b, (int)(q - b));
     } else {
-    AppendMenuW(m, MF_STRING, CMD_VIEW, BlockLeftMs() ? L"화면 전환 (인터넷 차단 중)" : L"화면 전환 (인터넷 차단)");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | (focusMin == 25 ? MF_CHECKED : 0), CMD_25, L"25분 공부 / 5분 휴식");
-    AppendMenuW(m, MF_STRING | (focusMin == 50 ? MF_CHECKED : 0), CMD_50, L"50분 공부 / 10분 휴식");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | (longOn ? MF_CHECKED : 0), CMD_LONG,
-                longMin == 30 ? L"4회마다 긴 휴식 (30분)" : L"4회마다 긴 휴식 (15분)");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, CMD_SWITCH, L"공부 ↔ 휴식 전환");
-    AppendMenuW(m, MF_STRING, CMD_RESET, L"리셋");
-    AppendMenuW(m, MF_STRING, CMD_HOME, L"위치 초기화 (왼쪽 아래)");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, CMD_EXIT, L"종료");
+        Text(fontTiny, DIM_TEXT, p, iy + (hSmall - hTiny) / 2, L"25분 = 1회", 8);
+        static const int lv[] = { 0, 1, 5, 9, 13 };   // 단계별 대표 횟수
+        int cs = S(10), lx = right - TextW(fontTiny, L"많음", 2), ly = iy + (hSmall - cs) / 2;
+        Text(fontTiny, DIM_TEXT, lx, iy + (hSmall - hTiny) / 2, L"많음", 2);
+        for (int i = 4; i >= 0; i--) { lx -= cs + S(3); RoundFill(lx, ly, cs, cs, S(3), HeatColor(lv[i] * SESSION_MIN)); }
+        lx -= S(4) + TextW(fontTiny, L"적음", 2);
+        Text(fontTiny, DIM_TEXT, lx, iy + (hSmall - hTiny) / 2, L"적음", 2);
     }
 
-    POINT p; GetCursorPos(&p);
-    menuOpen = 1; UpdateFade();
-    SetForegroundWindow(hwnd);   // 메뉴 밖을 클릭했을 때 메뉴가 닫히도록
-    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, NULL);
-    PostMessageW(hwnd, WM_NULL, 0, 0);
-    DestroyMenu(m);
-    menuOpen = 0;
+    // 버튼들
+    int y = iy + S(26), w = PW - 2 * p, half = (w - S(6)) / 2, bh = S(28), step = bh + S(6);
+    Fill(p, y - S(8), w, 1, BAR_BG);
+    Button(p, y, half, bh, CMD_25, L"25분 / 5분", focusMin == 25, 0);
+    Button(right - half, y, half, bh, CMD_50, L"50분 / 10분", focusMin == 50, 0);
+    y += step;
+    Button(p, y, w, bh, CMD_LONG, longMin == 30 ? L"4회마다 긴 휴식 (30분)" : L"4회마다 긴 휴식 (15분)", longOn, 1);
+    y += step;
+    Button(p, y, half, bh, CMD_SWITCH, L"공부 ↔ 휴식", 0, 0);
+    Button(right - half, y, half, bh, CMD_RESET, L"리셋", 0, 0);
+    y += step;
+    const WCHAR *vl = view == VIEW_BLOCK ? L"포모도로 화면" : L"인터넷 차단 화면";
+    if (BlockLeftMs() || applyProc) {
+        Button(p, y, half, bh, CMD_VIEW, vl, 0, 0);
+        Button(right - half, y, half, bh, applyProc ? 0 : CMD_UNBLOCK, L"차단 해제", 0, 0);
+    } else Button(p, y, w, bh, CMD_VIEW, vl, 0, 0);
+    y += step;
+    Text(fontTiny, Mix(BG_COLOR, DIM_TEXT, 60), p, y + (S(22) - hTiny) / 2, L"Esc로 닫기", 7);
+    Button(right - S(56), y, S(56), S(22), CMD_EXIT, L"종료", 0, 0);
+}
 
+static void ClosePanel(void)
+{
+    if (panel) DestroyWindow(panel);
+}
+
+static void DoCommand(int cmd)
+{
     switch (cmd) {
     case CMD_25: SetMode(25, 5, 15); break;
     case CMD_50: SetMode(50, 10, 30); break;
     case CMD_LONG: ToggleLong(); break;
     case CMD_SWITCH: SwitchPhase(0); break;
     case CMD_RESET: ResetPhase(); break;
-    case CMD_HOME: { POINT d = DefaultLocation(); SetWindowPos(hwnd, NULL, d.x, d.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE); SaveSettings(); } break;
     case CMD_VIEW: SetView(view == VIEW_BLOCK ? VIEW_TIMER : VIEW_BLOCK); break;
     case CMD_UNBLOCK: StopBlock(); break;
     case CMD_EXIT: DestroyWindow(hwnd); return;
     }
-    CheckHover();
-    // 메뉴가 끌어온 메모리(테마, 메뉴 비트맵 등)를 돌려줌
-    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+    if (panel) InvalidateRect(panel, NULL, FALSE);
+}
+
+static void PanelHover(int x, int y)
+{
+    int hot = -1, cell = -1;
+    POINT pt = { x, y };
+    for (int i = 0; i < nBtn; i++) if (PtInRect(&btn[i].r, pt)) hot = i;
+    int gx = x - HEAT_X, gy = y - HEAT_Y;
+    if (x >= 0 && gx >= 0 && gy >= 0 && gx % HEAT_STEP < HEAT_CELL && gy % HEAT_STEP < HEAT_CELL) {
+        int c = gx / HEAT_STEP, r = gy / HEAT_STEP;
+        if (c < HEAT_WEEKS && r < 7 && CellAgo(c, r) >= 0) cell = CellAgo(c, r);
+    }
+    if (hot != panelHot || cell != panelCell) { panelHot = hot; panelCell = cell; InvalidateRect(panel, NULL, FALSE); }
+}
+
+static LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        HDC main = memDC; memDC = panelDC; RenderPanel(); memDC = main;
+        BitBlt(dc, 0, 0, PW, PH, panelDC, 0, 0, SRCCOPY);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT t = { sizeof t, TME_LEAVE, h, 0 }; TrackMouseEvent(&t);
+        PanelHover((short)LOWORD(lp), (short)HIWORD(lp));
+        return 0;
+    }
+    case WM_MOUSELEAVE: PanelHover(-1, -1); return 0;
+    case WM_LBUTTONUP:
+        PanelHover((short)LOWORD(lp), (short)HIWORD(lp));
+        if (panelHot >= 0) DoCommand(btn[panelHot].cmd);
+        return 0;
+    case WM_KEYDOWN: if (wp == VK_ESCAPE) ClosePanel(); return 0;
+    case WM_ACTIVATE:   // 바깥을 클릭하면 닫힘 (확인 창이 떠도 닫힘)
+        // 앞으로 나오지 못한 채 열렸다면(포그라운드 잠금) 비활성 알림이 바로 와도 닫지 않음
+        if (LOWORD(wp) != WA_INACTIVE) panelActive = 1;
+        else if (panelActive) PostMessageW(h, WM_CLOSE, 0, 0);
+        return 0;
+    case WM_CLOSE: ClosePanel(); return 0;
+    case WM_DESTROY:
+        DeleteDC(panelDC); DeleteObject(panelBmp);
+        panel = NULL; panelHot = panelCell = -1; panelActive = 0;
+        UpdateFade();
+        // 패널이 쓴 메모리(창 정리, 활성화 때 붙은 IME 등)를 다 정리된 뒤에 돌려줌
+        SetTimer(hwnd, T_TRIM, 1000, NULL);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// 위젯 위에 (자리가 없으면 아래에) 열기
+static void OpenPanel(void)
+{
+    RECT r; GetWindowRect(hwnd, &r);
+    MONITORINFO mi = { sizeof mi }; GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT wa = mi.rcWork;
+    int x = r.left, y = r.top - S(8) - PH;
+    if (y < wa.top) y = r.bottom + S(8);
+    if (y + PH > wa.bottom) y = wa.bottom - PH;
+    if (x + PW > wa.right) x = wa.right - PW;
+    if (x < wa.left) x = wa.left;
+
+    HDC sdc = GetDC(NULL);
+    panelDC = CreateCompatibleDC(sdc);
+    panelBmp = CreateCompatibleBitmap(sdc, PW, PH);
+    ReleaseDC(NULL, sdc);
+    SelectObject(panelDC, panelBmp);
+    SetBkMode(panelDC, TRANSPARENT);
+
+    panel = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"PomodoroPanel", L"Pomodoro", WS_POPUP,
+                            x, y, PW, PH, hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    int round = 2; DwmSetWindowAttribute(panel, 33, &round, sizeof round);   // DWMWCP_ROUND
+    COLORREF border = BAR_BG; DwmSetWindowAttribute(panel, 34, &border, sizeof border);   // DWMWA_BORDER_COLOR
+    ShowWindow(panel, SW_SHOW);
+    SetForegroundWindow(panel);   // 바깥을 클릭했을 때 닫히도록 (WM_ACTIVATE)
+    UpdateFade();
 }
 
 // ---------- 윈도우 프로시저 ----------
@@ -763,6 +1074,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         else if (wp == T_TOP) { KillTimer(h, T_TOP); BringToTop(); }
         else if (wp == T_BLOCK) OnBlockTick();
         else if (wp == T_PROC) OnProc();
+        else if (wp == T_TRIM) { KillTimer(h, T_TRIM); SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1); }
         return 0;
     case WM_MOUSEMOVE:
         if (!hover) { hover = 1; TRACKMOUSEEVENT t = { sizeof t, TME_LEAVE, h, 0 }; TrackMouseEvent(&t); UpdateFade(); }
@@ -800,8 +1112,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CAPTURECHANGED:
         mouseDown = dragging = 0;
         return 0;
-    case WM_RBUTTONUP:
-        ShowMenu();
+    case WM_RBUTTONUP:   // 조작 패널 열기/닫기
+        if (panel) ClosePanel(); else OpenPanel();
         return 0;
     case WM_MOUSEWHEEL:   // 차단 화면에서 휠로 시간 조절
         if (view == VIEW_BLOCK) AddMins((short)HIWORD(wp) > 0 ? BLOCK_STEP : -BLOCK_STEP);
@@ -827,6 +1139,7 @@ static int Main(void)
     HDC sdc = GetDC(NULL); dpi = GetDeviceCaps(sdc, LOGPIXELSX);
 
     W = S(145); H = S(67); pad = S(9); emoSize = S(14); topY = S(7);
+    PW = S(236); PH = S(355);
     if (emoSize > EMOJI_SRC) emoSize = EMOJI_SRC;
     ScaleEmoji(EMOJI_FIRE, emoji[0], emoSize);
     ScaleEmoji(EMOJI_COFFEE, emoji[1], emoSize);
@@ -843,14 +1156,18 @@ static int Main(void)
     fontSmall = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Malgun Gothic");
     fontTime = CreateFontW(-S(26), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
     fontMid = CreateFontW(-S(18), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    fontTiny = CreateFontW(-S(10), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Malgun Gothic");
     TEXTMETRICW tm;
-    SelectObject(memDC, fontSmall); GetTextMetricsW(memDC, &tm); ascSmall = tm.tmAscent;
+    SelectObject(memDC, fontSmall); GetTextMetricsW(memDC, &tm); ascSmall = tm.tmAscent; hSmall = tm.tmHeight;
     SelectObject(memDC, fontTime); GetTextMetricsW(memDC, &tm); ascTime = tm.tmAscent;
     SelectObject(memDC, fontMid); GetTextMetricsW(memDC, &tm); ascMid = tm.tmAscent;
+    SelectObject(memDC, fontTiny); GetTextMetricsW(memDC, &tm); hTiny = tm.tmHeight;
 
     int n = (int)GetEnvironmentVariableW(L"APPDATA", iniPath, MAX_PATH - 32);
     lstrcpyW(iniPath + n, L"\\Pomodoro\\settings.ini");
     lstrcpyW(errLogPath, iniPath); lstrcpyW(errLogPath + n, L"\\Pomodoro\\block_error.log");
+    lstrcpyW(histPath, iniPath); lstrcpyW(histPath + n, L"\\Pomodoro\\history.ini");
+    LoadHistory();
 
     POINT pos;
     if (!LoadSettings(&pos)) pos = DefaultLocation();
@@ -866,6 +1183,10 @@ static int Main(void)
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     wc.lpszClassName = L"PomodoroTimer";
     RegisterClassW(&wc);
+    wc.lpfnWndProc = PanelProc;
+    wc.lpszClassName = L"PomodoroPanel";
+    RegisterClassW(&wc);
+    wc.lpszClassName = L"PomodoroTimer";
 
     hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED,
                            wc.lpszClassName, L"Pomodoro", WS_POPUP,
